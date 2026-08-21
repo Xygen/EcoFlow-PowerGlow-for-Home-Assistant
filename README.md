@@ -61,4 +61,3 @@ The authentication, MQTT transport, and existing read-path research are derived
 from `shuette42/ecoflow-energy-ha` and `Xygen/ecoflow-energy-ha-test` under the
 MIT license. PowerGlow protobuf field definitions were cross-checked against
 `foxthefox/ioBroker.ecoflow-mqtt`.
-

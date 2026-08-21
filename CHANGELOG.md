@@ -52,4 +52,3 @@
 - Discovers direct `HF33` PowerGlow devices and maps them to their PowerOcean parent.
 - Provides PowerGlow telemetry through the EcoFlow consumer detail API.
 - Adds target temperature and target power controls using narrowly scoped optional fields in the reconstructed `HeatingRodParamSet` protobuf command.
-

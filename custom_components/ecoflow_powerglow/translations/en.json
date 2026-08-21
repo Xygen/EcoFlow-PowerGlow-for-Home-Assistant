@@ -1,0 +1,48 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect EcoFlow PowerGlow",
+        "description": "Sign in with the account used by the EcoFlow app. Credentials are stored in Home Assistant's config-entry storage.",
+        "data": {"email": "Email", "password": "Password"},
+        "data_description": {
+          "email": "Email address of the EcoFlow app account that owns the PowerGlow.",
+          "password": "Password of the EcoFlow app account."
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not connect or authenticate",
+      "no_devices": "No PowerGlow could be associated with a PowerOcean in this account"
+    },
+    "abort": {"already_configured": "This EcoFlow account is already configured"}
+  },
+  "entity": {
+    "sensor": {
+      "heating_power": {"name": "Heating power"},
+      "water_temperature": {"name": "Water temperature"},
+      "power_from_pv": {"name": "Power from solar"},
+      "power_from_grid": {"name": "Power from grid"},
+      "power_from_battery": {"name": "Power from battery"},
+      "water_tank_volume": {"name": "Water tank volume"},
+      "self_check": {"name": "Self-check progress"},
+      "run_flag": {"name": "Run flag (raw)"},
+      "run_state": {"name": "Run state (raw)"},
+      "error_code": {"name": "Error code (raw)"}
+    },
+    "number": {
+      "target_temperature": {"name": "Target temperature"},
+      "target_power": {"name": "Target power"}
+    },
+    "select": {
+      "operating_mode": {
+        "name": "Operating mode",
+        "state": {
+          "off": "Off",
+          "solar": "Solar mode",
+          "manual": "Manual mode"
+        }
+      }
+    }
+  }
+}

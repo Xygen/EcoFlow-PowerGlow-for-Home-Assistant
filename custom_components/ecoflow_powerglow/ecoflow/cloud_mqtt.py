@@ -1,0 +1,622 @@
+"""EcoFlow Cloud MQTT client (Paho-based).
+
+Manages WSS (port 8084) and TCP (port 8883) connections to the EcoFlow broker.
+Configuration via constructor — no global config imports.
+
+Threading note: Paho runs its own network thread.  In HA, bridge callbacks
+to the event loop with ``hass.loop.call_soon_threadsafe()``.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import ssl
+import threading
+import time
+from collections.abc import Callable
+from typing import Any
+
+import paho.mqtt.client as mqtt
+
+from .clientid import generate_client_id
+from .const import (
+    DEFAULT_COUNTER_RESET_INTERVAL,
+    DEFAULT_MAX_RECONNECT_ATTEMPTS,
+    DEFAULT_MAX_RECONNECT_DELAY,
+    DEFAULT_MQTT_KEEPALIVE,
+    DEFAULT_RECONNECT_DELAY,
+    DEFAULT_WSS_KEEPALIVE,
+    MQTT_HOST,
+    MQTT_PORT_TCP,
+    MQTT_PORT_WSS,
+    MQTT_WSS_PATH,
+)
+from .energy_stream import build_energy_stream_activate_payload
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class EcoFlowMQTTClient:
+    """MQTT client for the EcoFlow cloud broker (WSS + TCP)."""
+
+    def __init__(
+        self,
+        certificate_account: str,
+        certificate_password: str,
+        device_sn: str,
+        message_handler: Callable[[str, bytes], None],
+        *,
+        user_id: str = "",
+        mqtt_host: str = MQTT_HOST,
+        wss_mode: bool = True,
+        enhanced_mode: bool = False,
+        subscribe_data: bool = True,
+        listen_only: bool = False,
+        status_handler: Callable | None = None,
+        auth_error_handler: Callable[[], None] | None = None,
+        max_reconnect_attempts: int = DEFAULT_MAX_RECONNECT_ATTEMPTS,
+        base_reconnect_delay: int = DEFAULT_RECONNECT_DELAY,
+        max_reconnect_delay: int = DEFAULT_MAX_RECONNECT_DELAY,
+    ) -> None:
+        self._cert_account = certificate_account
+        self._cert_password = certificate_password
+        self._device_sn = device_sn
+        self._user_id = user_id
+        self._mqtt_host = mqtt_host
+        self.message_handler = message_handler
+        self.status_handler = status_handler
+
+        self.client: mqtt.Client | None = None
+        self.connected = False
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = max_reconnect_attempts
+        self.base_reconnect_delay = base_reconnect_delay
+        self.max_reconnect_delay = max_reconnect_delay
+        self.last_reconnect_time: float = 0
+        self.last_connect_time: float = 0
+        self.last_disconnect_time: float = 0
+
+        self._auth_error_handler = auth_error_handler
+        self._wss_mode = wss_mode and bool(user_id)
+        self._enhanced_mode = enhanced_mode
+        self._subscribe_data = subscribe_data
+        # Hard guarantee that this connection never transmits. Enforced at
+        # publish() so it holds for every path, including the requests
+        # _on_connect fires on its own. Consumers that promise not to write
+        # to a device must set this - passing enhanced_mode=False only
+        # suppresses the energy stream switch, not get-all/latestQuotas.
+        self._listen_only = listen_only
+        self._notified_connected = False
+        self._last_counter_reset_time: float = 0
+        self._counter_reset_interval = DEFAULT_COUNTER_RESET_INTERVAL
+        # Guards client swaps (create/connect/force_reconnect/disconnect).
+        # Reentrant: force_reconnect holds it while calling create_client.
+        self._client_lock = threading.RLock()
+
+    def _log_issue(self, level: str, msg: str, *args: Any) -> None:
+        """Report a connection problem at the level it deserves.
+
+        A listen-only link is a diagnostics aid for a device the
+        integration does not support. Whether it connects changes nothing
+        for the user and there is nothing they could do about it, so its
+        failures belong at debug - a warning would be noise about a device
+        that has no entities in the first place. Everything else keeps its
+        original level.
+        """
+        if self._listen_only:
+            _LOGGER.debug(msg, *args)
+        else:
+            getattr(_LOGGER, level)(msg, *args)
+
+    def _log_retryable(self, msg: str, *args: Any) -> None:
+        """Report a failure that the watchdog is going to retry anyway.
+
+        A single failed reconnect is not a broken integration - a transient
+        DNS hiccup produces one, and the next attempt succeeds. Logging it at
+        ERROR puts a red line in the user's log for something that fixed
+        itself. It only becomes worth reporting once attempts are already
+        piling up, which is the same escalation the disconnect path uses.
+        """
+        if self._listen_only or self.reconnect_attempts == 0:
+            _LOGGER.debug(msg, *args)
+        else:
+            _LOGGER.warning(msg, *args)
+
+    @property
+    def cert_account(self) -> str:
+        """Return the certificate account used for MQTT authentication."""
+        return self._cert_account
+
+    @property
+    def user_id(self) -> str:
+        """Return the user ID used for app-auth MQTT topics."""
+        return self._user_id
+
+    @property
+    def wss_mode(self) -> bool:
+        """Return whether this client uses WSS (True) or TCP (False)."""
+        return self._wss_mode
+
+    def update_credentials(self, account: str, password: str) -> None:
+        """Update stored credentials for next reconnect (e.g. after rc=5).
+
+        Also updates the live Paho client so its internal auto-reconnect
+        uses the fresh credentials instead of retrying stale ones until
+        the next force_reconnect.
+        """
+        self._cert_account = account
+        self._cert_password = password
+        if self.client is not None:
+            try:
+                self.client.username_pw_set(account, password)
+            except Exception as exc:
+                _LOGGER.debug("MQTT: live credential update failed: %s", exc)
+
+    def create_client(self) -> bool:
+        """Create and configure the Paho MQTT client."""
+        with self._client_lock:
+            return self._create_client_unlocked()
+
+    def _create_client_unlocked(self) -> bool:
+        """Create the Paho client. Caller must hold ``_client_lock``."""
+        try:
+            if not self._cert_account or not self._cert_password:
+                self._log_issue("error", "MQTT: certificate_account or certificate_password missing")
+                return False
+
+            if self._wss_mode:
+                client_id = generate_client_id(self._user_id)
+                _LOGGER.debug("WSS MQTT client (port %d)", MQTT_PORT_WSS)
+                self.client = mqtt.Client(
+                    mqtt.CallbackAPIVersion.VERSION2,
+                    client_id=client_id,
+                    transport="websockets",
+                    clean_session=True,
+                )
+                self.client.ws_set_options(path=MQTT_WSS_PATH)
+            else:
+                # Must differ from other EcoFlow integrations'
+                # deterministic ID so both custom integrations can maintain a
+                # TCP session for the same device without kicking each other.
+                client_id = f"ecoflow_powerglow_{self._device_sn}"
+                _LOGGER.debug("TCP MQTT client (port %d)", MQTT_PORT_TCP)
+                self.client = mqtt.Client(
+                    mqtt.CallbackAPIVersion.VERSION2,
+                    client_id=client_id,
+                    clean_session=True,
+                )
+
+            self.client.username_pw_set(self._cert_account, self._cert_password)
+            self.client.tls_set(cert_reqs=ssl.CERT_REQUIRED)
+            self.client.on_connect = self._on_connect
+            self.client.on_disconnect = self._on_disconnect
+            self.client.on_message = self._on_message
+            return True
+
+        except Exception as exc:
+            self._log_issue("error", "MQTT: client creation failed: %s", exc)
+            return False
+
+    def _on_connect(self, client, userdata, flags, rc, properties=None):
+        """Callback on MQTT connection.
+
+        Under paho-mqtt 2.x VERSION2 callbacks ``rc`` is a ReasonCode object
+        (unhashable, MQTT 3.1.1 CONNACK codes mapped to MQTT 5 identifiers:
+        4 -> 134, 5 -> 135). Normalize to int first so dict lookups and
+        comparisons work for both int and ReasonCode inputs.
+        """
+        rc_val = rc.value if hasattr(rc, "value") else rc
+        if rc_val == 0:
+            # Subscribe to SET reply topics (all modes) for command acknowledgement tracking.
+            # A listen-only connection sends no commands, so there is nothing to
+            # acknowledge - and skipping these keeps the account identifiers out
+            # of the captured topic list.
+            if not self._listen_only:
+                set_reply_topic = f"/open/{self._cert_account}/{self._device_sn}/set_reply"
+                client.subscribe(set_reply_topic, qos=1)
+                if self._user_id:
+                    app_set = f"/app/{self._user_id}/{self._device_sn}/thing/property/set"
+                    app_set_reply = f"/app/{self._user_id}/{self._device_sn}/thing/property/set_reply"
+                    # Passive reverse-engineering aid: the official app's SET
+                    # frames reveal the exact PowerGlow command shape. Paho's
+                    # callback forwards them to the coordinator diagnostics.
+                    client.subscribe(app_set, qos=1)
+                    client.subscribe(app_set_reply, qos=1)
+
+            if self._subscribe_data:
+                # Subscribe to data topics (Enhanced Mode: MQTT is primary data source)
+                topic_json = f"/open/{self._cert_account}/{self._device_sn}/quota"
+                topic_pb = f"/app/device/property/{self._device_sn}"
+                client.subscribe(topic_json, qos=1)
+                client.subscribe(topic_pb, qos=0)
+
+                if self._user_id:
+                    topic_reply = f"/app/{self._user_id}/{self._device_sn}/thing/property/get_reply"
+                    client.subscribe(topic_reply, qos=1)
+
+                if not self._notified_connected:
+                    self._notified_connected = True
+                    _LOGGER.debug("MQTT connected — data topics: %s | %s | set_reply", topic_json, topic_pb)
+            else:
+                # Standard Mode: no data subscriptions, MQTT is for SET commands only
+                if not self._notified_connected:
+                    self._notified_connected = True
+                    _LOGGER.debug("MQTT connected — SET-only mode (set_reply subscribed)")
+
+            self.last_connect_time = time.monotonic()
+            self.connected = True
+            self.reconnect_attempts = 0
+
+            # WSS: send initial data requests on (re)connect.
+            # These are publishes to the device. They must not fire on a
+            # listen-only connection - publish() would refuse them anyway,
+            # but the energy stream switch below goes straight to the paho
+            # client and would bypass that check.
+            if self._wss_mode and self._user_id and not self._listen_only:
+                if self._enhanced_mode:
+                    # Enhanced: EnergyStreamSwitch + get-all + latestQuotas
+                    try:
+                        payload = build_energy_stream_activate_payload()
+                        set_topic = f"/app/{self._user_id}/{self._device_sn}/thing/property/set"
+                        client.publish(set_topic, payload, qos=1)
+                        _LOGGER.debug("EnergyStreamSwitch sent - energy_stream_report activated")
+                    except Exception as exc:
+                        _LOGGER.warning("EnergyStreamSwitch error: %s", exc)
+                    try:
+                        self.send_get_all()
+                        _LOGGER.debug("Post-connect get-all sent - requesting full state")
+                    except Exception as exc:
+                        _LOGGER.warning("Post-connect get-all error: %s", exc)
+                    try:
+                        self.send_latest_quotas()
+                        _LOGGER.debug("Post-connect latestQuotas sent - minimizing data gap")
+                    except Exception as exc:
+                        _LOGGER.warning("Post-connect latestQuotas error: %s", exc)
+                else:
+                    # Non-enhanced (SmartPlug, Delta): protobuf get-all + JSON latestQuotas
+                    try:
+                        self.send_get_all()
+                        _LOGGER.debug("Post-connect get-all sent - requesting full state")
+                    except Exception as exc:
+                        _LOGGER.warning("Post-connect get-all error: %s", exc)
+                    try:
+                        self.send_latest_quotas()
+                        _LOGGER.debug("Post-connect latestQuotas sent - JSON fallback")
+                    except Exception as exc:
+                        _LOGGER.warning("Post-connect latestQuotas error: %s", exc)
+
+            if self.status_handler:
+                self.status_handler("connected", 0, "Connected")
+        else:
+            rc_reasons = {
+                1: "Protocol version rejected",
+                2: "ClientID rejected",
+                3: "Broker unavailable",
+                4: "Bad username/password",
+                5: "Auth failed (credentials expired?)",
+                134: "Bad username/password",
+                135: "Not authorized (credentials expired?)",
+            }
+            reason = rc_reasons.get(rc_val, "unknown error")
+            auth_failure = rc_val in (4, 5, 134, 135)
+            if auth_failure:
+                self._log_issue(
+                    "warning",
+                    "MQTT connect failed: rc=%s (%s) — scheduling credential refresh",
+                    rc_val,
+                    reason,
+                )
+            else:
+                self._log_issue("error", "MQTT connect failed: rc=%s (%s)", rc_val, reason)
+            self.connected = False
+            if auth_failure and self._auth_error_handler:
+                self._auth_error_handler()
+
+    def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties):
+        """Callback on MQTT disconnect.
+
+        ``reason_code`` is a ReasonCode object under paho-mqtt 2.x VERSION2
+        callbacks — normalize to int before any comparison.
+        """
+        rc_val = reason_code.value if hasattr(reason_code, "value") else reason_code
+        was_connected = self.connected
+        self.connected = False
+        self._notified_connected = False
+
+        current_time = time.monotonic()
+        duration = current_time - self.last_connect_time if self.last_connect_time > 0 else 0
+        self.last_disconnect_time = current_time
+
+        if was_connected or rc_val != 0:
+            # First disconnect is normal (broker-side rotation) - only warn
+            # if previous reconnect attempts are already pending (sustained failure)
+            if rc_val != 0 and self.reconnect_attempts > 0 and not self._listen_only:
+                _log = _LOGGER.warning
+            else:
+                _log = _LOGGER.debug
+            _log(
+                "MQTT disconnect: rc=%s, was_connected=%s, duration=%.1fs, attempts=%d",
+                rc_val, was_connected, duration, self.reconnect_attempts,
+            )
+
+        if rc_val != 0:
+            self._schedule_reconnect()
+
+        if self.status_handler:
+            self.status_handler("disconnected", rc_val, f"Disconnected (rc={rc_val})")
+
+    def _should_attempt_reconnect(self) -> bool:
+        """Check if a reconnect attempt should be made. Never gives up permanently."""
+        current_time = time.monotonic()
+
+        if self.reconnect_attempts >= self.max_reconnect_attempts:
+            if (current_time - self._last_counter_reset_time) >= self._counter_reset_interval:
+                self._last_counter_reset_time = current_time
+                self.reconnect_attempts = 0
+                _LOGGER.debug("MQTT: counter reset after %ds — starting new cycle", self._counter_reset_interval)
+            else:
+                return False
+
+        min_delay = self._get_reconnect_delay()
+        if self.reconnect_attempts <= 3:
+            pass  # use base delay
+        elif self.reconnect_attempts <= 6:
+            min_delay *= 1.5
+        else:
+            min_delay *= 2.0
+        # Re-apply the cap: the tier multiplier must not push the effective
+        # delay beyond max_reconnect_delay.
+        min_delay = min(min_delay, self.max_reconnect_delay)
+
+        return current_time - self.last_reconnect_time >= min_delay
+
+    def _get_reconnect_delay(self) -> float:
+        """Calculate delay until next reconnect attempt."""
+        return min(
+            self.base_reconnect_delay * (2 ** self.reconnect_attempts),
+            self.max_reconnect_delay,
+        )
+
+    def _schedule_reconnect(self):
+        """Signal that a reconnect is needed."""
+        _LOGGER.debug(
+            "MQTT: reconnect scheduled — attempts: %d/%d",
+            self.reconnect_attempts,
+            self.max_reconnect_attempts,
+        )
+
+    # send_ping publishes JSON to the same /app/device/property/{sn} topic the
+    # client subscribes to — the broker echoes it back. Marker covers both
+    # compact and default json.dumps spellings.
+    _PING_ECHO_MARKERS = (b'{"command":"ping"', b'{"command": "ping"')
+
+    def _on_message(self, client, userdata, msg):
+        """Callback for incoming MQTT messages."""
+        if (
+            msg.topic == f"/app/device/property/{self._device_sn}"
+            and msg.payload.startswith(self._PING_ECHO_MARKERS)
+        ):
+            # Broker echo of our own keepalive ping — not device data
+            return
+        _LOGGER.debug("MQTT msg: %s (%d bytes) for %s", msg.topic, len(msg.payload), self._device_sn)
+        try:
+            self.message_handler(msg.topic, msg.payload)
+        except Exception as exc:
+            self._log_issue("warning", "MQTT message handler error for %s: %s", msg.topic, exc)
+
+    def connect(self) -> bool:
+        """Establish the MQTT connection."""
+        with self._client_lock:
+            try:
+                if self.is_connected():
+                    return True
+                if self.client is None and not self._create_client_unlocked():
+                    return False
+
+                port = MQTT_PORT_WSS if self._wss_mode else MQTT_PORT_TCP
+                keepalive = DEFAULT_WSS_KEEPALIVE if self._wss_mode else DEFAULT_MQTT_KEEPALIVE
+
+                _LOGGER.debug("Connecting to %s:%d (%s)", self._mqtt_host, port, "WSS" if self._wss_mode else "TCP")
+                self.client.connect(self._mqtt_host, port, keepalive)
+                return True
+            except Exception as exc:
+                self._log_issue("warning", "MQTT connection error: %s", exc)
+                return False
+
+    def try_reconnect(self) -> bool:
+        """Attempt reconnect if disconnected and backoff has elapsed."""
+        if self.is_connected():
+            return False
+        if not self._should_attempt_reconnect():
+            return False
+
+        self.reconnect_attempts += 1
+        self.last_reconnect_time = time.monotonic()
+
+        _LOGGER.debug(
+            "MQTT: reconnect attempt %d/%d",
+            self.reconnect_attempts, self.max_reconnect_attempts,
+        )
+        return self.force_reconnect()
+
+    def force_reconnect(self) -> bool:
+        """Force disconnect + reconnect with new ClientID (WSS).
+
+        Recreates the Paho client instead of manipulating private attributes.
+        No blocking sleep — the old connection is torn down synchronously.
+
+        Guarded by a non-blocking lock: overlapping calls (watchdog +
+        credential refresh run in separate executor threads) would orphan
+        a live Paho client with a running network thread. The second
+        caller skips instead.
+        """
+        if not self._client_lock.acquire(blocking=False):
+            _LOGGER.debug("Force-reconnect: skipped — another reconnect already in flight")
+            return False
+        try:
+            _LOGGER.debug("Force-reconnect: disconnecting and recreating client...")
+            try:
+                self.client.loop_stop()
+            except Exception:
+                pass
+            try:
+                self.client.disconnect()
+            except Exception:
+                pass
+            self.connected = False
+            self.client = None
+
+            # Recreate the client (generates new ClientID for WSS)
+            if not self._create_client_unlocked():
+                self._log_retryable(
+                    "Force-reconnect: client recreation failed"
+                )
+                return False
+
+            try:
+                port = MQTT_PORT_WSS if self._wss_mode else MQTT_PORT_TCP
+                keepalive = DEFAULT_WSS_KEEPALIVE if self._wss_mode else DEFAULT_MQTT_KEEPALIVE
+                self.client.connect(self._mqtt_host, port, keepalive)
+                self.client.loop_start()
+                _LOGGER.debug(
+                    "Force-reconnect: success at %s:%s (%s)",
+                    self._mqtt_host,
+                    port,
+                    "WSS" if self._wss_mode else "TCP",
+                )
+                return True
+            except Exception as exc:
+                self._log_retryable("Force-reconnect failed: %s", exc)
+                return False
+        finally:
+            self._client_lock.release()
+
+    def disconnect(self) -> None:
+        """Disconnect the MQTT client."""
+        with self._client_lock:
+            if self.client:
+                self.client.loop_stop()
+                self.client.disconnect()
+                self.connected = False
+
+    def start_loop(self) -> None:
+        """Start the Paho network loop."""
+        if self.client:
+            self.client.loop_start()
+
+    def stop_loop(self) -> None:
+        """Stop the Paho network loop."""
+        if self.client:
+            self.client.loop_stop()
+
+    def is_connected(self) -> bool:
+        """Check if the client is connected."""
+        return self.connected and self.client is not None and self.client.is_connected()
+
+    def publish(self, topic: str, payload: str | bytes, qos: int = 1) -> bool:
+        """Publish a message to the EcoFlow cloud broker."""
+        if self._listen_only:
+            # Single choke point: whatever path got here, nothing leaves.
+            _LOGGER.debug("Publish suppressed on listen-only connection (%s)", topic)
+            return False
+        if not self.is_connected():
+            return False
+        try:
+            result = self.client.publish(topic, payload, qos=qos)
+            return result.rc == 0
+        except Exception as exc:
+            _LOGGER.error("Publish failed (%s): %s", topic, exc)
+            return False
+
+    def send_proto_set(self, payload: bytes) -> bool:
+        """Send a binary protobuf SET command to the device (WSS only).
+
+        Publishes to /app/{user_id}/{sn}/thing/property/set.
+        Used by EnergyStreamSwitch and SoC limit SET commands.
+        """
+        if not self._wss_mode or not self.is_connected() or not self._user_id:
+            return False
+        topic = f"/app/{self._user_id}/{self._device_sn}/thing/property/set"
+        return self.publish(topic, payload, qos=1)
+
+    def send_energy_stream_switch(self) -> bool:
+        """Send EnergyStreamSwitch to keep energy_stream_report alive (WSS only)."""
+        try:
+            payload = build_energy_stream_activate_payload()
+            return self.send_proto_set(payload)
+        except Exception as exc:
+            _LOGGER.warning("EnergyStreamSwitch error: %s", exc)
+            return False
+
+    def send_latest_quotas(self) -> bool:
+        """Send a latestQuotas request (app keepalive)."""
+        if not self._user_id or not self.is_connected():
+            return False
+
+        topic = f"/app/{self._user_id}/{self._device_sn}/thing/property/get"
+        payload = json.dumps({
+            "from": "Android",
+            "id": str(int(time.time() * 1000)),
+            "moduleType": 0,
+            "operateType": "latestQuotas",
+            "params": {},
+            "version": "1.0",
+        })
+        return self.publish(topic, payload, qos=1)
+
+    def send_get_all(self) -> bool:
+        """Send a protobuf get-all request to fetch full device state.
+
+        Used for non-Enhanced devices (SmartPlug, Delta) connected via
+        app-auth WSS. The device responds with a full heartbeat on the
+        get_reply topic.
+        """
+        if not self._user_id or not self.is_connected():
+            return False
+
+        from .energy_stream import build_device_get_all_payload
+
+        topic = f"/app/{self._user_id}/{self._device_sn}/thing/property/get"
+        payload = build_device_get_all_payload()
+        return self.publish(topic, payload, qos=1)
+
+    def resend_initial_requests(self) -> bool:
+        """Re-send the post-connect request set without dropping the socket.
+
+        Some devices stop pushing telemetry while the WSS session stays up
+        (observed on PowerOcean Plus units, which only answer right after a
+        subscribe). Repeating the post-connect requests restores the data flow
+        at a fraction of the cost of a full reconnect, so the stale handler
+        tries this first and only tears the session down if it does not help.
+
+        Returns True if at least one request was published.
+        """
+        if not self._wss_mode or not self._user_id or not self.is_connected():
+            return False
+
+        sent = False
+        if self._enhanced_mode:
+            sent |= self.send_energy_stream_switch()
+        sent |= self.send_get_all()
+        sent |= self.send_latest_quotas()
+        return sent
+
+    def send_ping(self) -> bool:
+        """Send a ping heartbeat to the EcoFlow broker."""
+        if not self.is_connected():
+            return False
+        topic = f"/app/device/property/{self._device_sn}"
+        payload = json.dumps({
+            "command": "ping",
+            "value": int(time.time()) % 100000,
+            "deviceSn": self._device_sn,
+        })
+        return self.publish(topic, payload, qos=0)
+
+    def get_status(self) -> tuple:
+        """Return the current connection status."""
+        if self.is_connected():
+            uptime = time.monotonic() - self.last_connect_time if self.last_connect_time > 0 else 0
+            return "connected", 0, f"Connected ({int(uptime)}s)"
+        return "disconnected", self.reconnect_attempts, f"Disconnected (attempt {self.reconnect_attempts})"

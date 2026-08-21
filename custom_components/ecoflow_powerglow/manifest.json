@@ -1,0 +1,12 @@
+{
+  "domain": "ecoflow_powerglow",
+  "name": "EcoFlow PowerGlow",
+  "codeowners": ["@Xygen"],
+  "config_flow": true,
+  "documentation": "https://github.com/Xygen/PowerGlow",
+  "integration_type": "device",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/Xygen/PowerGlow/issues",
+  "requirements": ["paho-mqtt==2.1.0"],
+  "version": "0.1.7"
+}

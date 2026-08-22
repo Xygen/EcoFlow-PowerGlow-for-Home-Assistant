@@ -18,6 +18,9 @@
     "abort": {"already_configured": "Dieses EcoFlow-Konto ist bereits eingerichtet"}
   },
   "entity": {
+    "binary_sensor": {
+      "run_state": {"name": "Betriebsstatus"}
+    },
     "sensor": {
       "heating_power": {"name": "Heizleistung"},
       "water_temperature": {"name": "Wassertemperatur"},

@@ -8,7 +8,12 @@ from homeassistant.core import HomeAssistant
 
 from .coordinator import PowerGlowCoordinator
 
-PLATFORMS = [Platform.SENSOR, Platform.NUMBER, Platform.SELECT]
+PLATFORMS = [
+    Platform.BINARY_SENSOR,
+    Platform.SENSOR,
+    Platform.NUMBER,
+    Platform.SELECT,
+]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

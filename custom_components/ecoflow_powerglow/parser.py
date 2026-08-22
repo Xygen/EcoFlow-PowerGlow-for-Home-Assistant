@@ -280,6 +280,19 @@ def powerglow_operating_mode(data: dict[str, Any]) -> str | None:
     return {0: "solar", 1: "manual"}.get(mode)
 
 
+def powerglow_is_running(data: dict[str, Any]) -> bool | None:
+    """Return the binary run state, or none for missing/unknown values."""
+    try:
+        run_state = float(data["run_state_raw"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if run_state == 0.0:
+        return False
+    if run_state == 1.0:
+        return True
+    return None
+
+
 def _iter_reports(value: Any) -> Iterator[tuple[str, dict[str, Any]]]:
     if isinstance(value, dict):
         for key, nested in value.items():

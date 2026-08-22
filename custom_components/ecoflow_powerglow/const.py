@@ -98,7 +98,10 @@ SENSORS = (
         key="run_flag_raw", translation_key="run_flag", diagnostic=True
     ),
     PowerGlowSensorDescription(
-        key="run_state_raw", translation_key="run_state", diagnostic=True
+        key="run_state_raw",
+        translation_key="run_state",
+        diagnostic=True,
+        entity_registry_enabled_default=False,
     ),
     PowerGlowSensorDescription(
         key="error_code_raw", translation_key="error_code", diagnostic=True

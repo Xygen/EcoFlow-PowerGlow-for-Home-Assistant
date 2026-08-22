@@ -8,6 +8,7 @@ from custom_components.ecoflow_powerglow.parser import (
     extract_powerglow_reports,
     parse_powerglow_detail_response,
     parse_powerglow_mqtt_payload,
+    powerglow_is_running,
     powerglow_operating_mode,
 )
 
@@ -67,6 +68,14 @@ def test_operating_mode_combines_run_state_and_mode() -> None:
     assert powerglow_operating_mode({"run_state_raw": 1, "mode_raw": 0}) == "solar"
     assert powerglow_operating_mode({"run_state_raw": 1, "mode_raw": 1}) == "manual"
     assert powerglow_operating_mode({"run_state_raw": 2, "mode_raw": 0}) is None
+
+
+def test_binary_run_state_rejects_unknown_values() -> None:
+    assert powerglow_is_running({"run_state_raw": 0.0}) is False
+    assert powerglow_is_running({"run_state_raw": 1.0}) is True
+    assert powerglow_is_running({"run_state_raw": 1.5}) is None
+    assert powerglow_is_running({"run_state_raw": 2.0}) is None
+    assert powerglow_is_running({}) is None
 
 
 def test_parse_mqtt_incremental_report_by_serial() -> None:

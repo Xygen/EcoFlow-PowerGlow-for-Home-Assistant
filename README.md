@@ -16,7 +16,11 @@ variants cannot yet be guaranteed.
 ## Entities
 
 - Sensors: heating power, water temperature, PV/grid/battery power,
-  tank volume, self-check, run state, run flag, and error code.
+  tank volume, and self-check.
+- Binary sensor: operating status (running/not running).
+- Diagnostic sensors: raw run state, run flag, and error code. The raw run-state
+  sensor is disabled by default because the binary sensor is the preferred
+  representation.
 - Numbers: target temperature (10–80 °C) and target power (0–9000 W in 1 W
   increments).
 - Select: operating mode with Off, Solar mode, and Manual mode.

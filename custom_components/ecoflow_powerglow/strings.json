@@ -23,6 +23,9 @@
     }
   },
   "entity": {
+    "binary_sensor": {
+      "run_state": {"name": "Operating status"}
+    },
     "sensor": {
       "heating_power": {"name": "Heating power"},
       "water_temperature": {"name": "Water temperature"},

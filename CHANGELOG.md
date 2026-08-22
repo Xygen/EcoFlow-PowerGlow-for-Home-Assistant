@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.13
+
+- Adds a localized `running` binary sensor for the verified PowerGlow run-state
+  values: 0 is not running and 1 is running. Missing or unknown values make the
+  entity unavailable instead of guessing a state.
+- Keeps the numeric run-state sensor as a raw diagnostic entity, disabled by
+  default for new entity-registry entries.
+
 ## 0.1.12
 
 - Decodes the EcoFlow-provided PV, battery, and grid shares from fields 4, 5,

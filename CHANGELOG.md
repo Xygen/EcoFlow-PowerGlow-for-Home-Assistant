@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.14
+
+- Adds local 256 px and 512 px brand icons for Home Assistant 2026.3 and newer.
+- Reorganizes the README with an approachable user guide for installation and
+  everyday operation while retaining the full developer protocol reference.
+
 ## 0.1.13
 
 - Adds a localized `running` binary sensor for the verified PowerGlow run-state

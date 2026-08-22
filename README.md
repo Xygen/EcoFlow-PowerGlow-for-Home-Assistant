@@ -5,6 +5,14 @@ It discovers a direct `HF33` PowerGlow device in an EcoFlow account, associates
 it with the PowerOcean that carries its consumer reports, and exposes both
 telemetry and controls.
 
+## Hardware compatibility
+
+This integration has so far been tested only with the 9 kW PowerGlow variant,
+whose serial number starts with `HF33`. Smaller PowerGlow variants have not
+been tested and may use different serial-number prefixes. Because automatic
+discovery currently recognizes `HF33` devices, compatibility with those
+variants cannot yet be guaranteed.
+
 ## Entities
 
 - Sensors: heating power, water temperature, PV/grid/battery power,

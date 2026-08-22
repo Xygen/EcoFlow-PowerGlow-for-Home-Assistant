@@ -1,7 +1,13 @@
-"""Shared protobuf encoding primitives.
+"""Shared protobuf encoding and decoding primitives.
 
-Used by energy_stream.py (PowerOcean) and smartplug.py (SmartPlug SET commands).
+Used by PowerGlow command builders and the Enhanced-mode telemetry parser.
 """
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+
+type ProtobufValue = int | bytes
 
 
 def encode_varint(value: int) -> bytes:
@@ -42,34 +48,45 @@ def decode_varint(data: bytes, offset: int = 0) -> tuple[int, int]:
     raise ValueError("invalid protobuf varint")
 
 
-def _find_field(data: bytes, field_number: int, wire_type: int) -> int | bytes | None:
-    """Return the first matching primitive field from a protobuf message."""
+def iter_protobuf_fields(
+    data: bytes,
+) -> Iterator[tuple[int, int, ProtobufValue]]:
+    """Yield primitive protobuf fields while preserving repeats and wire types."""
     offset = 0
     while offset < len(data):
         tag, offset = decode_varint(data, offset)
-        current_field = tag >> 3
-        current_wire = tag & 0x07
-        if current_wire == 0:
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            raise ValueError("invalid protobuf field number 0")
+
+        if wire_type == 0:
             value, offset = decode_varint(data, offset)
-        elif current_wire == 1:
+        elif wire_type == 1:
             if offset + 8 > len(data):
                 raise ValueError("truncated protobuf fixed64 field")
             value = data[offset : offset + 8]
             offset += 8
-        elif current_wire == 2:
+        elif wire_type == 2:
             length, offset = decode_varint(data, offset)
             if offset + length > len(data):
                 raise ValueError("truncated protobuf bytes field")
             value = data[offset : offset + length]
             offset += length
-        elif current_wire == 5:
+        elif wire_type == 5:
             if offset + 4 > len(data):
                 raise ValueError("truncated protobuf fixed32 field")
             value = data[offset : offset + 4]
             offset += 4
         else:
-            raise ValueError(f"unsupported protobuf wire type: {current_wire}")
+            raise ValueError(f"unsupported protobuf wire type: {wire_type}")
 
+        yield field_number, wire_type, value
+
+
+def _find_field(data: bytes, field_number: int, wire_type: int) -> int | bytes | None:
+    """Return the first matching primitive field from a protobuf message."""
+    for current_field, current_wire, value in iter_protobuf_fields(data):
         if current_field == field_number and current_wire == wire_type:
             return value
     return None

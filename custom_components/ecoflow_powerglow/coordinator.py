@@ -18,11 +18,10 @@ from .api import PowerGlowApiClient
 from .const import (
     CONF_EMAIL,
     CONF_PASSWORD,
+    CONFIRMED_WRITE_GRACE_SECONDS,
     DOMAIN,
     ENERGY_STREAM_KEEPALIVE_SECONDS,
     LATEST_QUOTAS_INTERVAL_SECONDS,
-    MQTT_HINT_REFRESH_MIN_INTERVAL_SECONDS,
-    POST_COMMAND_REFRESH_DELAY_SECONDS,
     UPDATE_INTERVAL_SECONDS,
 )
 from .ecoflow.cloud_mqtt import EcoFlowMQTTClient
@@ -41,6 +40,12 @@ class _PendingCommand:
     value: int
     confirmed: asyncio.Future[None]
     broker_echoed: asyncio.Future[None]
+
+
+@dataclass(slots=True)
+class _ConfirmedWrite:
+    value: int
+    expires_at: float
 
 
 class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
@@ -64,13 +69,11 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self.devices: dict[str, dict[str, Any]] = {}
         self._mqtt: dict[str, EcoFlowMQTTClient] = {}
         self._pending_commands: dict[int, _PendingCommand] = {}
+        self._confirmed_writes: dict[tuple[str, str], _ConfirmedWrite] = {}
         self._command_sequence = int(time.time() * 1000) & 0x7FFFFFFF
         self.mqtt_frames: list[dict[str, Any]] = []
         self._energy_stream_handle: asyncio.TimerHandle | None = None
         self._latest_quotas_handle: asyncio.TimerHandle | None = None
-        self._post_command_refresh_handle: asyncio.TimerHandle | None = None
-        self._mqtt_hint_refresh_handle: asyncio.TimerHandle | None = None
-        self._last_mqtt_hint_refresh = 0.0
         self._initialized = False
 
     async def _async_update_data(self) -> dict[str, dict[str, Any]]:
@@ -94,7 +97,9 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                 if not device.get("parent_sn"):
                     data[serial] = {}
                     continue
-                data[serial] = await self.api.async_read_powerglow(device)
+                device_data = await self.api.async_read_powerglow(device)
+                self._apply_confirmed_writes(serial, device_data)
+                data[serial] = device_data
             return data
         except UpdateFailed:
             raise
@@ -186,7 +191,6 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             sent = await self.hass.async_add_executor_job(client.send_proto_set, payload)
             if not sent:
                 raise ConnectionError("EcoFlow rejected the MQTT publish")
-            self._schedule_post_command_refresh()
             try:
                 await asyncio.wait_for(
                     asyncio.shield(pending.confirmed), _COMMAND_CONFIRM_TIMEOUT
@@ -284,14 +288,14 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             self._apply_command_confirmation(payload)
 
     def _apply_mqtt_telemetry(self, parent_sn: str, payload: bytes) -> set[str]:
-        """Merge Enhanced-mode JSON telemetry into coordinator data."""
+        """Merge Enhanced-mode JSON or protobuf telemetry into coordinator data."""
         serials = [
             serial
             for serial, device in self.devices.items()
             if device.get("parent_sn") == parent_sn
         ]
         allow_unscoped = len(serials) == 1
-        updated_data = dict(self.data)
+        updated_data = dict(self.data or {})
         parsed_keys: set[str] = set()
 
         for serial in serials:
@@ -304,16 +308,16 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                 continue
             device_data = dict(updated_data.get(serial, {}))
             device_data.update(parsed)
+            self._apply_confirmed_writes(
+                serial,
+                device_data,
+                reported_keys=set(parsed),
+            )
             updated_data[serial] = device_data
             parsed_keys.update(parsed)
 
         if parsed_keys:
             self.async_set_updated_data(updated_data)
-        elif self._payload_mentions_powerglow(parent_sn, payload):
-            # The frame belongs to the PowerGlow but is not JSON. Until its
-            # protobuf report is mapped, use the push as a change hint and
-            # refresh HTTP at a conservative, rate-limited cadence.
-            self._schedule_mqtt_hint_refresh()
         return parsed_keys
 
     def _payload_mentions_powerglow(self, parent_sn: str, payload: bytes) -> bool:
@@ -366,35 +370,6 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         if self._mqtt:
             self._ensure_mqtt_maintenance()
 
-    def _schedule_post_command_refresh(self) -> None:
-        """Debounce an authoritative HTTP read shortly after a SET."""
-        if self._post_command_refresh_handle is not None:
-            self._post_command_refresh_handle.cancel()
-        self._post_command_refresh_handle = self.hass.loop.call_later(
-            POST_COMMAND_REFRESH_DELAY_SECONDS,
-            self._request_post_command_refresh,
-        )
-
-    def _request_post_command_refresh(self) -> None:
-        self._post_command_refresh_handle = None
-        self.hass.async_create_task(self.async_request_refresh())
-
-    def _schedule_mqtt_hint_refresh(self) -> None:
-        """Rate-limit HTTP reads prompted by unmapped PowerGlow frames."""
-        if self._mqtt_hint_refresh_handle is not None:
-            return
-        elapsed = self.hass.loop.time() - self._last_mqtt_hint_refresh
-        delay = max(0.0, MQTT_HINT_REFRESH_MIN_INTERVAL_SECONDS - elapsed)
-        self._mqtt_hint_refresh_handle = self.hass.loop.call_later(
-            delay,
-            self._request_mqtt_hint_refresh,
-        )
-
-    def _request_mqtt_hint_refresh(self) -> None:
-        self._mqtt_hint_refresh_handle = None
-        self._last_mqtt_hint_refresh = self.hass.loop.time()
-        self.hass.async_create_task(self.async_request_refresh())
-
     def _matching_pending_command(self, payload: bytes) -> _PendingCommand | None:
         """Return a pending PowerGlow command matching this envelope sequence."""
         if (
@@ -422,11 +397,42 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
     def _apply_pending_value(self, pending: _PendingCommand) -> None:
         """Publish a confirmed or provisionally broker-echoed value to HA."""
+        self._confirmed_writes[(pending.serial, pending.key)] = _ConfirmedWrite(
+            pending.value,
+            self.hass.loop.time() + CONFIRMED_WRITE_GRACE_SECONDS,
+        )
         updated_data = dict(self.data)
         device_data = dict(updated_data.get(pending.serial, {}))
         device_data[pending.key] = float(pending.value)
         updated_data[pending.serial] = device_data
         self.async_set_updated_data(updated_data)
+
+    def _apply_confirmed_writes(
+        self,
+        serial: str,
+        device_data: dict[str, Any],
+        *,
+        reported_keys: set[str] | None = None,
+    ) -> None:
+        """Prevent stale cloud snapshots from undoing a confirmed local write."""
+        now = self.hass.loop.time()
+        for identity, write in list(self._confirmed_writes.items()):
+            write_serial, key = identity
+            if write_serial != serial:
+                continue
+            if write.expires_at <= now:
+                self._confirmed_writes.pop(identity, None)
+                continue
+            cloud_matches = False
+            if reported_keys is None or key in reported_keys:
+                try:
+                    cloud_matches = float(device_data[key]) == float(write.value)
+                except (KeyError, TypeError, ValueError):
+                    pass
+            if cloud_matches:
+                self._confirmed_writes.pop(identity, None)
+            else:
+                device_data[key] = float(write.value)
 
     def _redact_payload(self, payload: bytes, parent_sn: str) -> bytes:
         redacted = payload
@@ -445,15 +451,12 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         for handle in (
             self._energy_stream_handle,
             self._latest_quotas_handle,
-            self._post_command_refresh_handle,
-            self._mqtt_hint_refresh_handle,
         ):
             if handle is not None:
                 handle.cancel()
         self._energy_stream_handle = None
         self._latest_quotas_handle = None
-        self._post_command_refresh_handle = None
-        self._mqtt_hint_refresh_handle = None
+        self._confirmed_writes.clear()
         for client in self._mqtt.values():
             await self.hass.async_add_executor_job(client.disconnect)
         self._mqtt.clear()

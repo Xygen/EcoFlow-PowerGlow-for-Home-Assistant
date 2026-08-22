@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.12
+
+- Decodes the EcoFlow-provided PV, battery, and grid shares from fields 4, 5,
+  and 6 of the same serial-scoped `212/33` report as measured heating power.
+- Treats omitted protobuf source fields as 0 W and rejects an implausible
+  source sum above heating power plus a 2 W rounding tolerance.
+
 ## 0.1.11
 
 - Keeps the authoritative 30-second HTTP poll independent from frequent MQTT

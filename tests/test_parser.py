@@ -1,9 +1,36 @@
+from struct import pack
+
+from custom_components.ecoflow_powerglow.ecoflow.proto_encoding import (
+    encode_field_bytes,
+    encode_field_varint,
+)
 from custom_components.ecoflow_powerglow.parser import (
     extract_powerglow_reports,
     parse_powerglow_detail_response,
     parse_powerglow_mqtt_payload,
     powerglow_operating_mode,
 )
+
+
+def _fast_powerglow_frame(
+    serial: str,
+    *,
+    heating: float,
+    pv: float,
+    battery: float,
+    grid: float,
+) -> bytes:
+    report = encode_field_bytes(1, serial.encode())
+    for field, value in ((2, heating), (4, pv), (5, battery), (6, grid)):
+        if value:
+            report += bytes([(field << 3) | 5]) + pack("<f", value)
+    pdata = encode_field_bytes(1, report)
+    header = (
+        encode_field_bytes(1, pdata)
+        + encode_field_varint(8, 212)
+        + encode_field_varint(9, 33)
+    )
+    return encode_field_bytes(1, header)
 
 
 def test_parse_exact_serial_and_merge_energy_stream() -> None:
@@ -76,7 +103,10 @@ def test_parse_mqtt_fast_powerglow_load_report() -> None:
         "5858"
     ).replace(b"X" * 16, serial.encode())
     assert parse_powerglow_mqtt_payload(payload, serial) == {
-        "heating_power_w": 100.0
+        "heating_power_w": 100.0,
+        "power_from_pv_w": 100.0,
+        "power_from_battery_w": 0.0,
+        "power_from_grid_w": 0.0,
     }
     assert parse_powerglow_mqtt_payload(payload, "HF33Z00000000000") == {}
 
@@ -91,7 +121,41 @@ def test_parse_mqtt_fast_powerglow_zero_load_report() -> None:
         "011058585858585858585858585858585858"
     ).replace(b"X" * 16, serial.encode())
     assert parse_powerglow_mqtt_payload(payload, serial) == {
-        "heating_power_w": 0.0
+        "heating_power_w": 0.0,
+        "power_from_pv_w": 0.0,
+        "power_from_battery_w": 0.0,
+        "power_from_grid_w": 0.0,
+    }
+
+
+def test_parse_mqtt_fast_powerglow_source_split() -> None:
+    serial = "HF33Z12345678901"
+    payload = _fast_powerglow_frame(
+        serial,
+        heating=1000,
+        pv=600,
+        battery=300,
+        grid=100,
+    )
+    assert parse_powerglow_mqtt_payload(payload, serial) == {
+        "heating_power_w": 1000.0,
+        "power_from_pv_w": 600.0,
+        "power_from_battery_w": 300.0,
+        "power_from_grid_w": 100.0,
+    }
+
+
+def test_rejects_source_split_above_heating_power() -> None:
+    serial = "HF33Z12345678901"
+    payload = _fast_powerglow_frame(
+        serial,
+        heating=100,
+        pv=80,
+        battery=30,
+        grid=0,
+    )
+    assert parse_powerglow_mqtt_payload(payload, serial) == {
+        "heating_power_w": 100.0
     }
 
 

@@ -32,6 +32,8 @@ _FIELD_MAP = {
 _PARAM_SUFFIX = "JTS1_HEATING_ROD_PARAM_REPORT"
 _ENERGY_SUFFIX = "JTS1_HEATING_ROD_ENERGY_STREAM_REPORT"
 _SERIAL_RE = re.compile(r"^[A-Z0-9]{12,32}$")
+_MAX_POWER_W = 20000.0
+_SOURCE_POWER_TOLERANCE_W = 2.0
 
 
 def parse_powerglow_detail_response(response: dict[str, Any], serial: str) -> dict[str, Any]:
@@ -155,7 +157,7 @@ def _merge_parameter_proto(
 def _merge_heating_power_proto(
     pdata: bytes, serial: str, result: dict[str, Any]
 ) -> None:
-    """Merge PowerGlow load power from the fast heating-rod report 212/33."""
+    """Merge PowerGlow load and source split from report 212/33."""
     try:
         reports = [
             value
@@ -174,15 +176,26 @@ def _merge_heating_power_proto(
         if report_serial is None or _decode_serial_bytes(report_serial) != serial:
             continue
 
-        # Live PowerGlow captures show fields 2 and 4 carrying the same load.
-        # Proto3 omits both at zero, so neither field means 0 W here.
-        power = _proto_float(report_fields, 2)
-        if power is None:
-            power = _proto_float(report_fields, 4)
-        if power is None:
-            power = 0.0
-        if math.isfinite(power) and 0 <= power <= 20000:
-            result["heating_power_w"] = float(power)
+        # HeatingRodEnergyStream maps fields 2/4/5/6 to total/PV/battery/grid.
+        # Proto3 omits default-valued floats, so absent fields explicitly mean 0 W.
+        power = _proto_float(report_fields, 2) or 0.0
+        if not math.isfinite(power) or not 0 <= power <= _MAX_POWER_W:
+            continue
+        result["heating_power_w"] = float(power)
+
+        source_values = {
+            "power_from_pv_w": _proto_float(report_fields, 4) or 0.0,
+            "power_from_battery_w": _proto_float(report_fields, 5) or 0.0,
+            "power_from_grid_w": _proto_float(report_fields, 6) or 0.0,
+        }
+        if not all(
+            math.isfinite(value) and 0 <= value <= _MAX_POWER_W
+            for value in source_values.values()
+        ):
+            continue
+        if sum(source_values.values()) > power + _SOURCE_POWER_TOLERANCE_W:
+            continue
+        result.update(source_values)
 
 
 def _proto_int(fields: list[tuple[int, int, int | bytes]], field: int) -> int | None:

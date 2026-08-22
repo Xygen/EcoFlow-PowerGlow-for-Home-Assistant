@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.1.10
+
+- Corrects the fast heating-power decoder from the parent flow report `241/33`
+  to the serial-scoped PowerGlow report `212/33` based on live 100 W and 0 W
+  captures from version 0.1.9.
+- Treats a matching `212/33` report without its default-valued power fields as
+  an explicit 0 W update.
+
+## 0.1.9
+
+- Decodes the fast binary PowerGlow accessory-flow report (`241/33`) and
+  updates measured heating power directly from MQTT, including explicit 0 W
+  when protobuf omits its default-valued power fields.
+- Decodes verified operating mode, run state, water temperature, tank volume,
+  self-check, run flag, and error code fields from report `212/8`.
+- Removes the stale two-second HTTP refresh and the continuous ten-second
+  binary-frame fallback polling introduced in 0.1.8.
+- Keeps a confirmed Home Assistant target value for up to 45 seconds so an
+  older cloud snapshot cannot make the control jump back while EcoFlow catches
+  up. The protection clears as soon as an authoritative report matches.
+
+## 0.1.8
+
+- Keeps Enhanced-mode PowerOcean energy-stream reports active with the
+  hardware-proven 20-second `EnergyStreamSwitch` cadence.
+- Requests `latestQuotas` every 30 seconds and applies matching PowerGlow JSON
+  MQTT reports immediately instead of waiting for the HTTP poll.
+- Uses PowerGlow-specific binary MQTT frames as rate-limited change hints,
+  reducing the fallback wait to at most 10 seconds without globally increasing
+  HTTP traffic.
+- Starts a debounced authoritative HTTP refresh two seconds after a Home
+  Assistant command.
+
 ## 0.1.7
 
 - Prevents false command errors when EcoFlow applies a SET but its MQTT

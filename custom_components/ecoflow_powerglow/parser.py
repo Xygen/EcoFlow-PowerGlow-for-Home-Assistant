@@ -116,7 +116,7 @@ def _parse_powerglow_proto(payload: bytes, serial: str) -> dict[str, Any]:
             continue
         if (cmd_func, cmd_id) == (212, 8):
             _merge_parameter_proto(pdata, serial, result)
-        elif (cmd_func, cmd_id) == (241, 33):
+        elif (cmd_func, cmd_id) == (212, 33):
             _merge_heating_power_proto(pdata, serial, result)
     return result
 
@@ -155,7 +155,7 @@ def _merge_parameter_proto(
 def _merge_heating_power_proto(
     pdata: bytes, serial: str, result: dict[str, Any]
 ) -> None:
-    """Merge PowerGlow load power from the fast accessory-flow report 241/33."""
+    """Merge PowerGlow load power from the fast heating-rod report 212/33."""
     try:
         reports = [
             value
@@ -168,17 +168,13 @@ def _merge_heating_power_proto(
     for report in reports:
         try:
             report_fields = list(iter_protobuf_fields(report))
-            component = _proto_bytes(report_fields, 1)
-            if component is None:
-                continue
-            component_fields = list(iter_protobuf_fields(component))
         except ValueError:
             continue
-        report_serial = _proto_bytes(component_fields, 2)
+        report_serial = _proto_bytes(report_fields, 1)
         if report_serial is None or _decode_serial_bytes(report_serial) != serial:
             continue
 
-        # Captures show fields 2 and 4 carrying the same PowerGlow load.
+        # Live PowerGlow captures show fields 2 and 4 carrying the same load.
         # Proto3 omits both at zero, so neither field means 0 W here.
         power = _proto_float(report_fields, 2)
         if power is None:

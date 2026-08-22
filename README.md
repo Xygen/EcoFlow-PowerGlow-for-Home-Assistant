@@ -31,21 +31,29 @@ the run-state command is sent.
 
 ## Protocol status and safety
 
-This is an unofficial cloud integration. Reads use EcoFlow's consumer detail
-endpoint. Writes use the app MQTT topic of the associated PowerOcean and the
-reconstructed protobuf message `HeatingRodParamSet` (`cmd_func=212`,
+This is an unofficial cloud integration. Reads combine EcoFlow Enhanced-mode
+MQTT updates with the consumer detail endpoint as a 30-second authoritative
+fallback. The PowerOcean energy stream is kept active every 20 seconds and
+`latestQuotas` is requested every 30 seconds. The fast binary heating-rod
+report (`212/33`) updates measured heating power directly from MQTT, normally
+within a few seconds; the verified parts of parameter report `212/8` update
+operating mode, run state, water temperature, tank volume, self-check, run flag,
+and error code. Writes use the app MQTT topic of the associated PowerOcean and
+the reconstructed protobuf message `HeatingRodParamSet` (`cmd_func=212`,
 `cmd_id=99`, system destination `96`). The temperature, run-state, and
 Solar-mode message shapes and replies were captured from the official iOS app.
-Home Assistant target-temperature writes have also been confirmed end-to-end
-against PowerGlow hardware.
+Home Assistant target-temperature and target-power writes have been confirmed
+end-to-end against PowerGlow hardware.
 
 Test with conservative values while watching the EcoFlow app and the physical
 heater. Home Assistant normally changes immediately after a matching EcoFlow
 MQTT SET reply. If that reply is lost but the broker echoes the exact command
 and sequence, the value is accepted provisionally instead of showing a false
-error; the 30-second HTTP poll remains the authoritative synchronization path.
-Temperature is constrained to the published 10–80 °C range and power to
-0–9000 W.
+error. A confirmed target remains visible while EcoFlow's slower cloud snapshot
+catches up, instead of being overwritten temporarily by an older value. The
+protection expires after 45 seconds and clears earlier as soon as an
+authoritative report matches. Temperature is constrained to the published
+10–80 °C range and power to 0–9000 W.
 
 Power targets below the heater's apparent minimum continuous output are kept as
 valid average targets. The PowerGlow may realize them by alternating roughly

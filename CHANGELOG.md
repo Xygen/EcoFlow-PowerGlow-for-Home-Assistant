@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.11
+
+- Keeps the authoritative 30-second HTTP poll independent from frequent MQTT
+  push updates. This restores PV, grid, and battery source-power updates while
+  retaining the roughly five-second measured heating-power updates from MQTT.
+
 ## 0.1.10
 
 - Corrects the fast heating-power decoder from the parent flow report `241/33`

@@ -6,7 +6,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -59,7 +59,11 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             _LOGGER,
             config_entry=entry,
             name=DOMAIN,
-            update_interval=timedelta(seconds=UPDATE_INTERVAL_SECONDS),
+            # MQTT push updates arrive more often than the HTTP interval.
+            # DataUpdateCoordinator.async_set_updated_data() resets its own
+            # refresh timer, so using update_interval here would let frequent
+            # PowerGlow frames postpone the authoritative HTTP read forever.
+            update_interval=None,
         )
         self.api = PowerGlowApiClient(
             async_get_clientsession(hass),
@@ -74,7 +78,12 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self.mqtt_frames: list[dict[str, Any]] = []
         self._energy_stream_handle: asyncio.TimerHandle | None = None
         self._latest_quotas_handle: asyncio.TimerHandle | None = None
+        self._http_poll_handle: asyncio.TimerHandle | None = None
         self._initialized = False
+
+    def start_polling(self) -> None:
+        """Start the HTTP poll on a timer that MQTT updates cannot reset."""
+        self._schedule_http_poll()
 
     async def _async_update_data(self) -> dict[str, dict[str, Any]]:
         try:
@@ -370,6 +379,28 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         if self._mqtt:
             self._ensure_mqtt_maintenance()
 
+    def _schedule_http_poll(self) -> None:
+        """Schedule an authoritative HTTP read independently of MQTT pushes."""
+        if self._http_poll_handle is not None or self.hass.is_stopping:
+            return
+        if self.config_entry.pref_disable_polling:
+            return
+        self._http_poll_handle = self.hass.loop.call_later(
+            UPDATE_INTERVAL_SECONDS,
+            self._request_http_poll,
+        )
+
+    def _request_http_poll(self) -> None:
+        """Run one HTTP refresh and arrange the next fixed poll."""
+        self._http_poll_handle = None
+        self.hass.async_create_task(self._async_http_poll())
+
+    async def _async_http_poll(self) -> None:
+        try:
+            await self.async_refresh()
+        finally:
+            self._schedule_http_poll()
+
     def _matching_pending_command(self, payload: bytes) -> _PendingCommand | None:
         """Return a pending PowerGlow command matching this envelope sequence."""
         if (
@@ -451,11 +482,13 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         for handle in (
             self._energy_stream_handle,
             self._latest_quotas_handle,
+            self._http_poll_handle,
         ):
             if handle is not None:
                 handle.cancel()
         self._energy_stream_handle = None
         self._latest_quotas_handle = None
+        self._http_poll_handle = None
         self._confirmed_writes.clear()
         for client in self._mqtt.values():
             await self.hass.async_add_executor_job(client.disconnect)

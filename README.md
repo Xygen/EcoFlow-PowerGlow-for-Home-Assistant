@@ -36,7 +36,9 @@ MQTT updates with the consumer detail endpoint as a 30-second authoritative
 fallback. The PowerOcean energy stream is kept active every 20 seconds and
 `latestQuotas` is requested every 30 seconds. The fast binary heating-rod
 report (`212/33`) updates measured heating power directly from MQTT, normally
-within a few seconds; the verified parts of parameter report `212/8` update
+within a few seconds. Its push updates cannot postpone the independent
+30-second HTTP reads that provide PV, grid, and battery source power. The
+verified parts of parameter report `212/8` update
 operating mode, run state, water temperature, tank volume, self-check, run flag,
 and error code. Writes use the app MQTT topic of the associated PowerOcean and
 the reconstructed protobuf message `HeatingRodParamSet` (`cmd_func=212`,

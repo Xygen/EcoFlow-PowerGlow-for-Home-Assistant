@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import re
 from collections.abc import Iterator
 from typing import Any
@@ -39,13 +40,72 @@ def parse_powerglow_detail_response(response: dict[str, Any], serial: str) -> di
         for item in items:
             if not isinstance(item, dict) or _decode_serial(item.get("hrSn")) != serial:
                 continue
-            for source, target in _FIELD_MAP.items():
-                if source in item:
-                    try:
-                        result[target] = float(item[source])
-                    except (TypeError, ValueError):
-                        pass
+            _merge_powerglow_fields(item, result)
     return result
+
+
+def parse_powerglow_mqtt_payload(
+    payload: bytes,
+    serial: str,
+    *,
+    allow_unscoped: bool = False,
+) -> dict[str, Any]:
+    """Parse a JSON MQTT update for one PowerGlow.
+
+    Enhanced-mode replies use several shapes: the consumer-detail report,
+    direct incremental items carrying ``hrSn``, and PowerOcean quota maps with
+    ``ems_heating_rod.*`` keys. Unscoped quota values are accepted only when
+    the parent has exactly one PowerGlow, so one accessory cannot update
+    another accessory by accident.
+    """
+    try:
+        response = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    if not isinstance(response, dict):
+        return {}
+
+    result = parse_powerglow_detail_response(response, serial)
+    for item in _iter_dicts(response):
+        if _decode_serial(item.get("hrSn")) == serial:
+            _merge_powerglow_fields(item, result)
+
+        if not allow_unscoped:
+            continue
+
+        heating_rod = item.get("ems_heating_rod")
+        if isinstance(heating_rod, dict):
+            _merge_powerglow_fields(heating_rod, result)
+
+        scoped: dict[str, Any] = {}
+        prefix = "ems_heating_rod."
+        for key, value in item.items():
+            if isinstance(key, str) and key.startswith(prefix):
+                scoped[key.removeprefix(prefix)] = value
+        _merge_powerglow_fields(scoped, result)
+
+    return result
+
+
+def _merge_powerglow_fields(item: dict[str, Any], result: dict[str, Any]) -> None:
+    """Merge known numeric PowerGlow fields from one report item."""
+    for source, target in _FIELD_MAP.items():
+        if source in item:
+            try:
+                result[target] = float(item[source])
+            except (TypeError, ValueError):
+                pass
+
+
+def _iter_dicts(value: Any) -> Iterator[dict[str, Any]]:
+    """Yield every dictionary in an arbitrary JSON value."""
+    if isinstance(value, dict):
+        yield value
+        for nested in value.values():
+            yield from _iter_dicts(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _iter_dicts(nested)
 
 
 def extract_powerglow_reports(response: dict[str, Any]) -> set[str]:

@@ -15,10 +15,20 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import PowerGlowApiClient
-from .const import CONF_EMAIL, CONF_PASSWORD, DOMAIN, UPDATE_INTERVAL_SECONDS
+from .const import (
+    CONF_EMAIL,
+    CONF_PASSWORD,
+    DOMAIN,
+    ENERGY_STREAM_KEEPALIVE_SECONDS,
+    LATEST_QUOTAS_INTERVAL_SECONDS,
+    MQTT_HINT_REFRESH_MIN_INTERVAL_SECONDS,
+    POST_COMMAND_REFRESH_DELAY_SECONDS,
+    UPDATE_INTERVAL_SECONDS,
+)
 from .ecoflow.cloud_mqtt import EcoFlowMQTTClient
 from .ecoflow.energy_stream import build_powerglow_parameter_payload
 from .ecoflow.proto_encoding import extract_envelope_varint
+from .parser import parse_powerglow_mqtt_payload
 
 _LOGGER = logging.getLogger(__name__)
 _COMMAND_CONFIRM_TIMEOUT = 5
@@ -56,6 +66,11 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._pending_commands: dict[int, _PendingCommand] = {}
         self._command_sequence = int(time.time() * 1000) & 0x7FFFFFFF
         self.mqtt_frames: list[dict[str, Any]] = []
+        self._energy_stream_handle: asyncio.TimerHandle | None = None
+        self._latest_quotas_handle: asyncio.TimerHandle | None = None
+        self._post_command_refresh_handle: asyncio.TimerHandle | None = None
+        self._mqtt_hint_refresh_handle: asyncio.TimerHandle | None = None
+        self._last_mqtt_hint_refresh = 0.0
         self._initialized = False
 
     async def _async_update_data(self) -> dict[str, dict[str, Any]]:
@@ -130,6 +145,9 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             await self.hass.async_add_executor_job(client.start_loop)
             self._mqtt[parent_sn] = client
 
+        if self._mqtt:
+            self._ensure_mqtt_maintenance()
+
     async def async_set_parameter(self, serial: str, key: str, value: int) -> None:
         """Write exactly one optional PowerGlow parameter."""
         device = self.devices[serial]
@@ -168,6 +186,7 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             sent = await self.hass.async_add_executor_job(client.send_proto_set, payload)
             if not sent:
                 raise ConnectionError("EcoFlow rejected the MQTT publish")
+            self._schedule_post_command_refresh()
             try:
                 await asyncio.wait_for(
                     asyncio.shield(pending.confirmed), _COMMAND_CONFIRM_TIMEOUT
@@ -239,6 +258,17 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         elif topic.endswith("/thing/property/set"):
             kind = "observed_set"
         else:
+            parsed_keys = self._apply_mqtt_telemetry(parent_sn, payload)
+            if parsed_keys or self._payload_mentions_powerglow(parent_sn, payload):
+                self._append_mqtt_frame(
+                    {
+                        "timestamp": datetime.now(UTC).isoformat(),
+                        "kind": "telemetry",
+                        "channel": self._telemetry_channel(topic),
+                        "size": len(payload),
+                        "parsed_keys": sorted(parsed_keys),
+                    }
+                )
             return
         self._append_mqtt_frame(
             {
@@ -252,6 +282,118 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             self._record_command_broker_echo(payload)
         elif kind == "set_reply":
             self._apply_command_confirmation(payload)
+
+    def _apply_mqtt_telemetry(self, parent_sn: str, payload: bytes) -> set[str]:
+        """Merge Enhanced-mode JSON telemetry into coordinator data."""
+        serials = [
+            serial
+            for serial, device in self.devices.items()
+            if device.get("parent_sn") == parent_sn
+        ]
+        allow_unscoped = len(serials) == 1
+        updated_data = dict(self.data)
+        parsed_keys: set[str] = set()
+
+        for serial in serials:
+            parsed = parse_powerglow_mqtt_payload(
+                payload,
+                serial,
+                allow_unscoped=allow_unscoped,
+            )
+            if not parsed:
+                continue
+            device_data = dict(updated_data.get(serial, {}))
+            device_data.update(parsed)
+            updated_data[serial] = device_data
+            parsed_keys.update(parsed)
+
+        if parsed_keys:
+            self.async_set_updated_data(updated_data)
+        elif self._payload_mentions_powerglow(parent_sn, payload):
+            # The frame belongs to the PowerGlow but is not JSON. Until its
+            # protobuf report is mapped, use the push as a change hint and
+            # refresh HTTP at a conservative, rate-limited cadence.
+            self._schedule_mqtt_hint_refresh()
+        return parsed_keys
+
+    def _payload_mentions_powerglow(self, parent_sn: str, payload: bytes) -> bool:
+        """Return whether a frame contains a child serial in plain protobuf bytes."""
+        return any(
+            serial.encode("ascii", errors="ignore") in payload
+            for serial, device in self.devices.items()
+            if device.get("parent_sn") == parent_sn
+        )
+
+    @staticmethod
+    def _telemetry_channel(topic: str) -> str:
+        """Return a non-sensitive diagnostic topic label."""
+        if topic.endswith("/quota"):
+            return "quota"
+        if topic.endswith("/get_reply"):
+            return "get_reply"
+        if "/app/device/property/" in topic:
+            return "property"
+        return "other"
+
+    def _ensure_mqtt_maintenance(self) -> None:
+        """Keep the Enhanced-mode stream and quota replies alive."""
+        if self._energy_stream_handle is None:
+            self._energy_stream_handle = self.hass.loop.call_later(
+                ENERGY_STREAM_KEEPALIVE_SECONDS,
+                self._send_energy_stream_keepalive,
+            )
+        if self._latest_quotas_handle is None:
+            self._latest_quotas_handle = self.hass.loop.call_later(
+                LATEST_QUOTAS_INTERVAL_SECONDS,
+                self._send_latest_quotas,
+            )
+
+    def _send_energy_stream_keepalive(self) -> None:
+        """Re-activate PowerOcean energy-stream reports."""
+        self._energy_stream_handle = None
+        for client in self._mqtt.values():
+            if client.is_connected():
+                self.hass.async_add_executor_job(client.send_energy_stream_switch)
+        if self._mqtt:
+            self._ensure_mqtt_maintenance()
+
+    def _send_latest_quotas(self) -> None:
+        """Request the newest app-level quota snapshot."""
+        self._latest_quotas_handle = None
+        for client in self._mqtt.values():
+            if client.is_connected():
+                self.hass.async_add_executor_job(client.send_latest_quotas)
+        if self._mqtt:
+            self._ensure_mqtt_maintenance()
+
+    def _schedule_post_command_refresh(self) -> None:
+        """Debounce an authoritative HTTP read shortly after a SET."""
+        if self._post_command_refresh_handle is not None:
+            self._post_command_refresh_handle.cancel()
+        self._post_command_refresh_handle = self.hass.loop.call_later(
+            POST_COMMAND_REFRESH_DELAY_SECONDS,
+            self._request_post_command_refresh,
+        )
+
+    def _request_post_command_refresh(self) -> None:
+        self._post_command_refresh_handle = None
+        self.hass.async_create_task(self.async_request_refresh())
+
+    def _schedule_mqtt_hint_refresh(self) -> None:
+        """Rate-limit HTTP reads prompted by unmapped PowerGlow frames."""
+        if self._mqtt_hint_refresh_handle is not None:
+            return
+        elapsed = self.hass.loop.time() - self._last_mqtt_hint_refresh
+        delay = max(0.0, MQTT_HINT_REFRESH_MIN_INTERVAL_SECONDS - elapsed)
+        self._mqtt_hint_refresh_handle = self.hass.loop.call_later(
+            delay,
+            self._request_mqtt_hint_refresh,
+        )
+
+    def _request_mqtt_hint_refresh(self) -> None:
+        self._mqtt_hint_refresh_handle = None
+        self._last_mqtt_hint_refresh = self.hass.loop.time()
+        self.hass.async_create_task(self.async_request_refresh())
 
     def _matching_pending_command(self, payload: bytes) -> _PendingCommand | None:
         """Return a pending PowerGlow command matching this envelope sequence."""
@@ -300,6 +442,18 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         del self.mqtt_frames[:-20]
 
     async def async_shutdown(self) -> None:
+        for handle in (
+            self._energy_stream_handle,
+            self._latest_quotas_handle,
+            self._post_command_refresh_handle,
+            self._mqtt_hint_refresh_handle,
+        ):
+            if handle is not None:
+                handle.cancel()
+        self._energy_stream_handle = None
+        self._latest_quotas_handle = None
+        self._post_command_refresh_handle = None
+        self._mqtt_hint_refresh_handle = None
         for client in self._mqtt.values():
             await self.hass.async_add_executor_job(client.disconnect)
         self._mqtt.clear()

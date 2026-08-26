@@ -1,5 +1,12 @@
 # Changelog
 
+## Development note
+
+The experimental authentication and reauthentication changes developed after
+0.1.14 were withdrawn because they caused valid EcoFlow app credentials to be
+rejected during startup. Version 0.1.14 remains the reference baseline for
+further development.
+
 ## 0.1.14
 
 - Adds local 256 px and 512 px brand icons for Home Assistant 2026.3 and newer.

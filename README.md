@@ -166,3 +166,29 @@ The authentication, MQTT transport, and existing read-path research are
 derived from `shuette42/ecoflow-energy-ha` and
 `Xygen/ecoflow-energy-ha-test` under the MIT license. PowerGlow protobuf field
 definitions were cross-checked against `foxthefox/ioBroker.ecoflow-mqtt`.
+
+
+## RF-002 experimental shutdown action
+
+**Draft branch only, not released or installed in Home Assistant.** The
+optional `ecoflow_powerglow.request_shutdown` action takes a single
+PowerGlow `device_id`. It sends a *new* `run_state_raw=0` command
+even when Home Assistant already reports `off`. The normal operating-mode
+selector remains unchanged.
+
+```yaml
+action: ecoflow_powerglow.request_shutdown
+data:
+  device_id: YOUR_POWERGLOW_DEVICE_ID
+response_variable: shutdown_result
+```
+
+The service responds with `transport_evidence` (`set_reply_matched`
+or `broker_echo_only`) and `physical_shutdown_verified: false`.
+A matching MQTT reply is **not proof** of physical power-off. Missing
+confirmation raises an error. The service does not change the heater's
+target power and does not stop other regulators or pending commands.
+
+**Not a hardware safety cut-off.** Late commands, Cloud/App writers,
+communication outages and Solar-mode fallback require further testing
+and a separately approved safety strategy before production deployment.

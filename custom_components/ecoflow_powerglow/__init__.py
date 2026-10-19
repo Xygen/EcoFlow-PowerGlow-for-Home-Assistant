@@ -14,6 +14,7 @@ from homeassistant.helpers.typing import ConfigType
 
 from .const import DOMAIN
 from .coordinator import PowerGlowCoordinator
+from .services import async_register_services
 
 PLATFORMS = [
     Platform.BINARY_SENSOR,

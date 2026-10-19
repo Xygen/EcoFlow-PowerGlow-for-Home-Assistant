@@ -1,0 +1,5 @@
+# Isolated HA 2026.10.1 integration-service registration tests.
+# Not installed in the user's Home Assistant system.
+homeassistant==2026.10.1
+pytest-homeassistant-custom-component==0.13.372
+paho-mqtt==2.1.0

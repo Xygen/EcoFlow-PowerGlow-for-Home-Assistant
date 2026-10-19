@@ -192,3 +192,8 @@ target power and does not stop other regulators or pending commands.
 **Not a hardware safety cut-off.** Late commands, Cloud/App writers,
 communication outages and Solar-mode fallback require further testing
 and a separately approved safety strategy before production deployment.
+
+**Isolated CI evidence:** [37 offline tests and 2 real HA Core 2026.10.1
+service-registration tests passed, Ruff clean](https://github.com/Xygen/EcoFlow-PowerGlow-for-Home-Assistant/actions/runs/39299947122).
+The HA runtime job does not load a real EcoFlow account or send commands.
+The feature remains a review-only prototype.

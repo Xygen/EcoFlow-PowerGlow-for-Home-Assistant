@@ -1,5 +1,12 @@
 # Changelog
 
+## Development note
+
+The experimental authentication and reauthentication changes developed after
+0.1.14 were withdrawn because they caused valid EcoFlow app credentials to be
+rejected during startup. Version 0.1.14 remains the reference baseline for
+further development.
+
 ## Unreleased (RF-002 draft branch only)
 
 - Prototype: device-scoped `ecoflow_powerglow.request_shutdown` sends a fresh

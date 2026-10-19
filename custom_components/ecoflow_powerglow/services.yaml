@@ -1,0 +1,14 @@
+request_shutdown:
+  name: Request shutdown
+  description: >-
+    Transmit a new PowerGlow OFF command even if the cached state is already
+    OFF. The response describes MQTT transport evidence only and does not
+    verify that physical heating power is zero.
+  fields:
+    device_id:
+      name: PowerGlow device
+      description: The Home Assistant device ID of the specific PowerGlow.
+      required: true
+      selector:
+        device:
+          integration: ecoflow_powerglow

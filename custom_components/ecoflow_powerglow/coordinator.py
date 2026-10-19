@@ -162,8 +162,19 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         if self._mqtt:
             self._ensure_mqtt_maintenance()
 
-    async def async_set_parameter(self, serial: str, key: str, value: int) -> None:
-        """Write exactly one optional PowerGlow parameter."""
+    async def async_request_shutdown(self, serial: str) -> str:
+        """Always publish a fresh OFF command, regardless of cached run state.
+
+        This is a *transport request* only, not a physical power-off proof.
+        In-flight device commands outside Home Assistant remain possible.
+        """
+        return await self.async_set_parameter(serial, "run_state_raw", 0)
+
+    async def async_set_parameter(self, serial: str, key: str, value: int) -> str:
+        """Write one PowerGlow parameter; report SET-reply versus broker echo.
+
+        Both outcomes are transport-level evidence, not verified actuator state.
+        """
         device = self.devices[serial]
         if key not in {
             "target_temperature_c",
@@ -222,10 +233,11 @@ class PowerGlowCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                     _LOGGER.debug(
                         "PowerGlow SET reply missing; accepted matching broker echo"
                     )
-                    return
+                    return "broker_echo_only"
                 raise ConnectionError(
                     "EcoFlow did not confirm the MQTT command"
                 ) from exc
+            return "set_reply_matched"
         finally:
             self._pending_commands.pop(seq, None)
 

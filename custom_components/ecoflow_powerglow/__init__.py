@@ -41,3 +41,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unloaded:
         await coordinator.async_shutdown()
     return unloaded
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Register action handlers."""
+    async_register_services(hass)
+    return True

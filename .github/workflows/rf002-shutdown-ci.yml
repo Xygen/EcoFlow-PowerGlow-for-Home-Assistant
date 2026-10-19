@@ -8,6 +8,8 @@ on:
     paths:
       - "custom_components/ecoflow_powerglow/**"
       - "tests/**"
+      - "ha_tests/**"
+      - "requirements_ha_test.txt"
       - "requirements_test.txt"
       - "pyproject.toml"
       - ".github/workflows/rf002-shutdown-ci.yml"

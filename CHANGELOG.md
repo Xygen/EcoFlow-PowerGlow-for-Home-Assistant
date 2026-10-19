@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased (RF-002 draft branch only)
+
+- Prototype: device-scoped `ecoflow_powerglow.request_shutdown` sends a fresh
+  `run_state_raw=0` even when the cached run state already shows Off.
+- MQTT transport evidence is reported separately for SET replies and
+  provisional broker echoes. No physical power-off confirmation is claimed.
+- Added offline regression tests, GitHub Actions and service documentation.
+- Not deployed, not a released safety function, and not integrated with V3.
+
 ## 0.1.14
 
 - Adds local 256 px and 512 px brand icons for Home Assistant 2026.3 and newer.

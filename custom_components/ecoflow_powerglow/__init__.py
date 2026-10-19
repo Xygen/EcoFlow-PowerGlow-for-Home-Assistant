@@ -2,17 +2,11 @@
 
 from __future__ import annotations
 
-import voluptuous as vol
-
-from homeassistant.config_entries import ConfigEntry, ConfigEntryState
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
-
-from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
-from homeassistant.helpers import config_validation as cv, device_registry as dr
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.typing import ConfigType
 
-from .const import DOMAIN
 from .coordinator import PowerGlowCoordinator
 from .services import async_register_services
 
@@ -22,6 +16,12 @@ PLATFORMS = [
     Platform.NUMBER,
     Platform.SELECT,
 ]
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Register PowerGlow actions before device config entries are loaded."""
+    async_register_services(hass)
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -41,9 +41,3 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unloaded:
         await coordinator.async_shutdown()
     return unloaded
-
-
-async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Register action handlers."""
-    async_register_services(hass)
-    return True

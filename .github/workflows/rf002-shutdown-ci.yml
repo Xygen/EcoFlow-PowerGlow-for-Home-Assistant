@@ -33,3 +33,16 @@ jobs:
         run: python -m pytest -q tests
       - name: Check candidate integration lint
         run: python -m ruff check custom_components/ecoflow_powerglow/__init__.py custom_components/ecoflow_powerglow/services.py custom_components/ecoflow_powerglow/coordinator.py tests/test_shutdown_service.py
+
+  isolated-ha-service:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Install HA Core and pinned test harness
+        run: python -m pip install --disable-pip-version-check -r requirements_ha_test.txt
+      - name: Run HA service-registration tests with no device I/O
+        run: python -m pytest -q ha_tests

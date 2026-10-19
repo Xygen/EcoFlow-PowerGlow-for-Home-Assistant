@@ -1,0 +1,33 @@
+name: RF-002 PowerGlow shutdown prototype
+
+on:
+  push:
+    branches:
+      - feature/rf002-forced-shutdown-poc
+  pull_request:
+    paths:
+      - "custom_components/ecoflow_powerglow/**"
+      - "tests/**"
+      - "requirements_test.txt"
+      - "pyproject.toml"
+      - ".github/workflows/rf002-shutdown-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install isolated test dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements_test.txt
+      - name: Run offline tests (no real Home Assistant or EcoFlow)
+        run: python -m pytest -q tests
+      - name: Check candidate integration lint
+        run: python -m ruff check custom_components/ecoflow_powerglow/__init__.py custom_components/ecoflow_powerglow/services.py custom_components/ecoflow_powerglow/coordinator.py tests/test_shutdown_service.py

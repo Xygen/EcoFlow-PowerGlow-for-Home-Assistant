@@ -7,7 +7,6 @@ This module never runs on its own; the integration registers its action.
 from __future__ import annotations
 
 import voluptuous as vol
-
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
